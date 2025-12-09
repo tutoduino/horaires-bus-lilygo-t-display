@@ -55,16 +55,16 @@ uint8_t loopCounter;
 
 
 // ---------------------------------------------------------------------------
-//  Vérifie si myTime_t > struct tm (seulement heure/minute)
+//  Vérifie si time1 est superieur ou egal a time2 (seulement heure/minute)
 // ---------------------------------------------------------------------------
-bool isMyTimeGreater(myTime_t time1, tm time2) {
+bool isMyTimeGreaterOrEqual(myTime_t time1, tm time2) {
   // Compare heures
   if (time1.heure != time2.tm_hour) {
     return time1.heure > time2.tm_hour;
   }
 
   // Heures égales → compare minutes
-  return time1.minute > time2.tm_min;
+  return time1.minute >= time2.tm_min;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +326,7 @@ void loop() {
   int nbBus = 0;
   while ((nbBus <= numBuses) && (nbBusDisplayed < NB_BUS_DISPLAYED)) {
     // N'affiche que les bus dont l'heure de depart est superieur a l'heure actuelle
-    if (isMyTimeGreater(nextBuses[nbBus].busTime, timeinfo)) {
+    if (isMyTimeGreaterOrEqual(nextBuses[nbBus].busTime, timeinfo)) {
       Serial.printf("Ligne %s  %02d:%02d\n",
                     nextBuses[nbBus].busLine,
                     nextBuses[nbBus].busTime.heure,
