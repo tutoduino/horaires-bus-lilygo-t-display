@@ -4,7 +4,7 @@
 #include <Arduino.h>  // pour String
 
 // Identifiant de l'arret
-const char* stop_point_ref = "STIF:StopPoint:Q:28607:";
+const char* stopPointRef = "STIF:StopPoint:Q:28607:";
 
 // Structure pour stocker le mapping
 struct LineMapping {
