@@ -1,5 +1,5 @@
 // Recuperation des horaires des prochains passages de bus a un arret en Ile de France
-// Les informations sont recuperees de la plateform PRIM geree par IdFM 
+// Les informations sont recuperees de la plateform PRIM geree par IdFM
 // Affichage de ces informations sur un LilyGo T-Display
 // https://tutoduino.fr/
 // Copyleft 2025
@@ -12,8 +12,12 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_sleep.h>
 #include "secrets.h"
 #include "line_mapping.h"
+
+// Bouton qui permet de sortir de veille profonde
+#define BUTTON_PIN 35
 
 // Broches du ST7789 sur le LilyGo T-Display
 #define TFT_MOSI 19
@@ -27,16 +31,41 @@
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 // Nombre de prochains passages a afficher
-#define NB_BUS_SCHEDULE 3
+#define NB_BUS_DISPLAYED 3
+// Nombre de prochains passages à lire dans la réponse du serveur PRIM
+#define MAX_NB_BUS_SCHEDULE 6
+
+// Structure pour stocker l'heure
+struct myTime_t {
+  int heure;
+  int minute;
+};
 
 // Structure pour stocker les informations sur les prochains passages
-struct BusSchedule {
-  String line;
-  String time;
+struct busSchedule_t {
+  String busLine;
+  myTime_t busTime;
 };
 
 // URL du service, il doit etre completee par l'identifiant de l'arret de bus qui est stocke dans "secrets.h"
-const char* service_url = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring?MonitoringRef=";
+const char* serviceUrl = "https://prim.iledefrance-mobilites.fr/marketplace/stop-monitoring?MonitoringRef=";
+
+// Variable globale utilisée pour la mise en veille
+uint8_t loopCounter;
+
+
+// ---------------------------------------------------------------------------
+//  Vérifie si myTime_t > struct tm (seulement heure/minute)
+// ---------------------------------------------------------------------------
+bool isMyTimeGreater(myTime_t time1, tm time2) {
+  // Compare heures
+  if (time1.heure != time2.tm_hour) {
+    return time1.heure > time2.tm_hour;
+  }
+
+  // Heures égales → compare minutes
+  return time1.minute > time2.tm_min;
+}
 
 // ---------------------------------------------------------------------------
 //  Synchronisation de l'heure NTP + fuseau France (DST auto)
@@ -48,67 +77,73 @@ void setupTime() {
 }
 
 // ---------------------------------------------------------------------------
-//  Convertit l'heure UTC en heure locale, le format de l'heure étant une
-//  chaîne de caractères « HH:MM »
+//  Convertit l'heure UTC en heure locale
 // ---------------------------------------------------------------------------
-String convertUTCtoLocal(String utcTime) {
-  struct tm local_tm = { 0 };
+myTime_t convertUTCtoLocal(myTime_t utcTime) {
+  struct tm localTime = { 0 };
   char buffer[6];
-  int h = utcTime.substring(0, 2).toInt();
-  int m = utcTime.substring(3, 5).toInt();
+  myTime_t myLocalTime;
 
-  // Recuperation de l'heure locale en UTC
-  if (!getLocalTime(&local_tm)) {
+  // Recuperation de l'heure locale en UTC pour vérifier si
+  // nous sommes en heures d'hiver ou heure d'ete (isdst)
+  if (!getLocalTime(&localTime)) {
     Serial.println("Erreur : impossible d'obtenir l'heure locale !");
     return utcTime;  // fallback
   }
 
-  switch (local_tm.tm_isdst) {
+  myLocalTime = utcTime;
+
+  switch (localTime.tm_isdst) {
     case 0:  // heure d'hiver = UTC + 1
-      h += 1;
+      myLocalTime.heure += 1;
       break;
     case 1:  // heure d'ete = UTC + 2
-      h += 2;
+      myLocalTime.heure += 2;
       break;
     default:  // indetermine ou erreur, retourne l'heure UTC
       break;
   }
 
   // Gestion dépassement 24h
-  if (h >= 24) h -= 24;
-  if (h < 0) h += 24;
+  if (myLocalTime.heure >= 24) {
+    myLocalTime.heure -= 24;
+  }
+  if (myLocalTime.heure < 0) {
+    myLocalTime.heure += 24;
+  }
 
-  sprintf(buffer, "%02d:%02d", h, m);
-  return String(buffer);
+  return myLocalTime;
 }
 
 // ---------------------------------------------------------------------------
 //  Extrait l'heure HH:MM d'une chaîne ISO 8601 "YYYY-MM-DDTHH:MM:SS.000Z"
 // ---------------------------------------------------------------------------
-String getTimeHHMM(const char* isoString) {
-  char timeStr[6];  // HH:MM\0
+myTime_t getTimeHHMM(const char* isoString) {
 
-  // Positions fixes dans ISO 8601
-  timeStr[0] = isoString[11];  // H1
-  timeStr[1] = isoString[12];  // H2
-  timeStr[2] = ':';
-  timeStr[3] = isoString[14];  // M1
-  timeStr[4] = isoString[15];  // M2
-  timeStr[5] = '\0';
+  myTime_t myTime;
 
-  return String(timeStr);
+  // JJ et MM sont a des positions fixes dans ISO 8601
+  myTime.heure = (isoString[11] - '0') * 10 + (isoString[12] - '0');
+  myTime.minute = (isoString[14] - '0') * 10 + (isoString[15] - '0');
+
+  return myTime;
 }
 
 // -----------------------------------------------------------------------------
 //  Appel de l'API PRIM pour obtenir les horaires des passages des prochains bus
-//  Retourne le nombre d'horaires trouves
+//  Retourne le nombre d'horaires contenant des informations sur les lignes
+//  qui nous interessent.
 // -----------------------------------------------------------------------------
-int getExpectedDepartureTime(BusSchedule schedules[NB_BUS_SCHEDULE]) {
+int getExpectedDepartureTime(busSchedule_t schedules[MAX_NB_BUS_SCHEDULE]) {
 
-  // Initialise les NB_BUS_SCHEDULE prochains bus
-  for (int i = 0; i < NB_BUS_SCHEDULE; i++) {
-    schedules[i].line = "";
-    schedules[i].time = "";
+  // Nombre d'horaire retourné
+  int nbScheduleInfo = 0;
+
+  // Initialise les MAX_NB_BUS_SCHEDULE prochains bus
+  for (int i = 0; i < MAX_NB_BUS_SCHEDULE; i++) {
+    schedules[i].busLine = "";
+    schedules[i].busTime.heure = 0;
+    schedules[i].busTime.minute = 0;
   }
 
   // Verifie que le Wi-Fi est bien connecte
@@ -119,9 +154,9 @@ int getExpectedDepartureTime(BusSchedule schedules[NB_BUS_SCHEDULE]) {
 
   // Contruit la requete HTTP pour l'arret concerne
   HTTPClient http;
-  String full_url = String(service_url) + String(stop_point_ref);  
-  http.begin(full_url);
-  http.addHeader("apikey", api_key);
+  String fullUrl = String(serviceUrl) + String(stopPointRef);
+  http.begin(fullUrl);
+  http.addHeader("apikey", apiKey);
   http.addHeader("accept", "application/json");
 
   // Envoir la requete et recupere la reponse (payload)
@@ -137,6 +172,8 @@ int getExpectedDepartureTime(BusSchedule schedules[NB_BUS_SCHEDULE]) {
   String payload = http.getString();
   http.end();
 
+  Serial.println(payload);
+
   // La reponse au format JSON peut être volumineuse en fonction du nombre de lignes de bus a cet arret
   DynamicJsonDocument doc(40 * 1024);
 
@@ -145,14 +182,17 @@ int getExpectedDepartureTime(BusSchedule schedules[NB_BUS_SCHEDULE]) {
     return 0;
   }
 
+  // Tableau de N elements contenant les informations sur le passage
+  // dont le numero de la ligne et l'heure de départ
   JsonArray visits =
     doc["Siri"]["ServiceDelivery"]["StopMonitoringDelivery"][0]["MonitoredStopVisit"];
 
-  int count = 0;
 
-  // Recupere les informations (ligne de bus et heure de depart) pour les NB_BUS_SCHEDULE prochains passages
+  // Recupere les informations (ligne de bus et heure de depart) pour les
+  // prochains passages, en se limiant à MAX_NB_BUS_SCHEDULE elements
   for (JsonObject visit : visits) {
-    if (count >= NB_BUS_SCHEDULE) {
+    if (nbScheduleInfo >= MAX_NB_BUS_SCHEDULE) {
+      Serial.println("Maximum number of information collected, skip following ones");
       break;
     }
     // Identifiant de la ligne de bus
@@ -162,31 +202,45 @@ int getExpectedDepartureTime(BusSchedule schedules[NB_BUS_SCHEDULE]) {
       visit["MonitoredVehicleJourney"]["MonitoredCall"]["ExpectedDepartureTime"];
 
     if (!lineRef || !expectedDepartureTime) {
+      Serial.println("No data");
       continue;
     }
 
     // Vérifie que nous souhaitons les informations concernant cette ligne de bus
     bool isKnownLine = false;
     for (int i = 0; i < lineMappingsSize; i++) {
-        if (lineMappings[i].ref == String(lineRef)) {
-            isKnownLine = true;
-            break;
-        }
+      if (lineMappings[i].ref == String(lineRef)) {
+        isKnownLine = true;
+        break;
+      }
     }
 
-    // Rertourner l'heure du prochain depart pour les lignes de bus identifiees dans le lineMapping
-    if (isKnownLine) { 
-
-      schedules[count].line = mapLineRefToNumber(lineRef);;
-      schedules[count].time = convertUTCtoLocal(getTimeHHMM(expectedDepartureTime));
-
-      count++;
+    // Rertourner l'heure du prochain depart et le numero de la ligne si cette ligne
+    // nous interesse
+    if (isKnownLine) {
+      schedules[nbScheduleInfo].busLine = mapLineRefToNumber(lineRef);
+      schedules[nbScheduleInfo].busTime = convertUTCtoLocal(getTimeHHMM(expectedDepartureTime));
+      nbScheduleInfo++;
     }
   }
 
-  return count;
+  return nbScheduleInfo;
 }
 
+// -----------------------------------------------------------------------------
+//  Mise en veille profonde de l'ESP32 et de l'ecran LCD
+// -----------------------------------------------------------------------------
+void enterDeepSleep() {
+  // Configure la sortie de veille par appui sur bouton
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, LOW);
+
+  // Éteindre écran et le mettre en veille
+  digitalWrite(TFT_BL, LOW);
+  tft.writeCommand(0x10);
+
+  // Activer la veille profonde du microcontrolleur
+  esp_deep_sleep_start();
+}
 
 // ---------------------------------------------------------------------------
 //  SETUP
@@ -196,8 +250,11 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // Le bouton est une entrée qui permet de sortir de veille
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
   // Connexion Wi-Fi
-  WiFi.begin(wifi_ssid, wifi_password);
+  WiFi.begin(wifiSsid, wifiPassword);
   Serial.print("Connexion Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -205,6 +262,7 @@ void setup() {
   }
   Serial.println("\nConnecté au Wi-Fi");
 
+  // Configure la recuperation de l'heure et le fuseau horaire
   setupTime();  // NTP + TZ
 
   // Allume le rétroéclairage
@@ -215,23 +273,28 @@ void setup() {
   tft.init(135, 240);
   tft.setRotation(1);
   tft.setFont(&FreeSansBold18pt7b);
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(30, 70);
-  tft.write("Tutoduino");
   delay(1000);
+
+  loopCounter = 0;
 }
 
 
 // ---------------------------------------------------------------------------
-//  LOOP PRINCIPALE
+//  BOUCLE PRINCIPALE
 // ---------------------------------------------------------------------------
 void loop() {
 
-  BusSchedule nextBuses[NB_BUS_SCHEDULE];
+  busSchedule_t nextBuses[MAX_NB_BUS_SCHEDULE];
   struct tm timeinfo;
   char timeString[6];
   char buf[15];
+
+  // Met l'ESP32 en veille profonde et eteind l'ecran
+  // après 1 minutes (30 sec par loop)
+  loopCounter++;
+  if (loopCounter > 2) {
+    enterDeepSleep();
+  }
 
   tft.fillScreen(ST77XX_BLACK);
 
@@ -249,24 +312,36 @@ void loop() {
   // Récupère les horaires des prochains bus
   int numBuses = getExpectedDepartureTime(nextBuses);
 
-  if (numBuses > NB_BUS_SCHEDULE) {
-    Serial.printf("Erreur");
-  } else if (numBuses > 0) {
-    for (int i = 0; i < numBuses; i++) {
-      Serial.printf("Ligne %s  %s\n",
-                    nextBuses[i].line,
-                    nextBuses[i].time);
-
-      snprintf(buf, sizeof(buf), "%s  %s",
-               nextBuses[i].line, nextBuses[i].time);
-      tft.setTextColor(ST77XX_CYAN);
-      tft.setCursor(0, 65 + 30 * i);
-      tft.print(buf);
-    }
-  } else {
-    tft.print("Aucun bus");
+  Serial.printf("numBuses = %d\n", numBuses);
+  if (numBuses > MAX_NB_BUS_SCHEDULE) {
+    Serial.printf("Erreur\n");
+    return;
   }
 
-  // Réactualise toutes les 60 secondes
-  delay(60 * 1000);
+  // Affichage de la ligne et de l'heure de départ des prochains bus
+  // Le nombre de bus affiches est limite a NB_BUS_DISPLAYED
+  // Seuls les bus dont l'horaire de depart est posterieur a
+  // l'heure courante sont affiches
+  int nbBusDisplayed = 0;
+  int nbBus = 0;
+  while ((nbBus <= numBuses) && (nbBusDisplayed < NB_BUS_DISPLAYED)) {
+    // N'affiche que les bus dont l'heure de depart est superieur a l'heure actuelle
+    if (isMyTimeGreater(nextBuses[nbBus].busTime, timeinfo)) {
+      Serial.printf("Ligne %s  %02d:%02d\n",
+                    nextBuses[nbBus].busLine,
+                    nextBuses[nbBus].busTime.heure,
+                    nextBuses[nbBus].busTime.minute);
+
+      snprintf(buf, sizeof(buf), "%s  %02d:%02d",
+               nextBuses[nbBus].busLine, nextBuses[nbBus].busTime.heure, nextBuses[nbBus].busTime.minute);
+      tft.setTextColor(ST77XX_CYAN);
+      tft.setCursor(0, 65 + 30 * nbBusDisplayed);
+      tft.print(buf);
+      nbBusDisplayed++;
+    }
+    nbBus++;
+  }
+
+  // Réactualise toutes les 30 secondes
+  delay(30 * 1000);
 }
