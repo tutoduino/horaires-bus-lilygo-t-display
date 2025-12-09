@@ -1,3 +1,3 @@
-const char* api_key = "YOUR-TOKEN
-const char* wifi_ssid = "YOUR-SSID";
-const char* wifi_password = "YOUR-PWD";
+const char* apiKey = "YOUR-TOKEN
+const char* wifiSsid = "YOUR-SSID";
+const char* wifiPassword = "YOUR-PWD";
